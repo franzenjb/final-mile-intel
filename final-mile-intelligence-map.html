@@ -1,0 +1,1559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!--
+  ============================================================================
+  FINAL MILE INTELLIGENCE MAP
+  Live hazards, infrastructure gaps, and AI-assisted operational context
+  ============================================================================
+
+  HOW TO RUN
+  ----------
+  1. Double-click this file. That's it. It runs in any modern browser.
+  2. Internet is required (CDN libraries + NWS + OpenStreetMap tiles).
+  3. No build step, no API keys.
+
+  HOW TO ENABLE LIGHTRAG
+  ----------------------
+  1. Run a LightRAG server locally that exposes POST /query.
+     Default expected endpoint: http://localhost:8020/query
+  2. Find the LIGHTRAG_CONFIG block below and set enabled: true.
+  3. Optionally change `mode` to "naive" | "local" | "global" | "hybrid".
+  4. The "Generate AI Briefing" button will then call LightRAG with the
+     current map context (alerts, infrastructure within view, click point).
+  5. If LightRAG is unreachable, the app gracefully falls back to a deterministic
+     mock briefing so demos never break.
+
+  WHERE TO REPLACE DEMO INFRASTRUCTURE DATA
+  -----------------------------------------
+  Search for "DEMO_INFRASTRUCTURE" below. That array holds shelters, hospitals,
+  fire stations, and logistics/staging sites. Replace with your real GeoJSON
+  or feature service results. Keep the `type` field as one of:
+    "shelter" | "hospital" | "fire" | "logistics"
+  No phone numbers are fabricated; only name, type, city, capacity. Add real
+  contact metadata only from authoritative sources.
+
+  HOW TO EMBED IN ARCGIS EXPERIENCE BUILDER VIA GITHUB PAGES
+  ---------------------------------------------------------
+  1. Push this single file to a GitHub repo (e.g. final-mile-intel/index.html).
+  2. Settings -> Pages -> Deploy from branch (main / root).
+  3. Copy the resulting URL, e.g. https://<user>.github.io/final-mile-intel/
+  4. In Experience Builder, add an "Embed" widget and paste the URL.
+  5. The page is responsive and will fill the embed frame.
+  6. For private orgs, host the file in a portal item (Web Page item type)
+     instead and embed via the same widget.
+  ============================================================================
+-->
+<title>Final Mile Intelligence Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Marker cluster (graceful fallback if it fails) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+<!-- Leaflet.heat for risk heat surface -->
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+
+<!-- deck.gl (optional wow layer; falls back to Leaflet if it fails) -->
+<script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+
+<style>
+  :root {
+    --bg-0: #0a0e14;
+    --bg-1: #11161f;
+    --bg-2: #161d28;
+    --bg-3: #1d2735;
+    --line: #243042;
+    --line-2: #2e3b50;
+    --text-0: #e8eef7;
+    --text-1: #aab4c4;
+    --text-2: #6f7c91;
+    --accent: #d72027;          /* Red Cross red */
+    --accent-2: #ff5a3c;
+    --warn: #f5a623;
+    --ok: #4ade80;
+    --info: #60a5fa;
+    --extreme: #b3001b;
+    --severe: #e8472c;
+    --moderate: #f5a623;
+    --minor: #f6e05e;
+    --unknown: #6f7c91;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --serif: "Libre Baskerville", "Georgia", serif;
+    --shadow: 0 10px 30px rgba(0,0,0,0.45);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg-0);
+    color: var(--text-0);
+    font-family: var(--sans);
+    font-size: 13px;
+    overflow: hidden;
+  }
+
+  /* ---------- Top bar ---------- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0;
+    height: 56px;
+    background: linear-gradient(180deg, rgba(10,14,20,0.96), rgba(10,14,20,0.86));
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 18px;
+    padding: 0 18px;
+    z-index: 1000;
+    backdrop-filter: blur(8px);
+  }
+  #topbar .brand {
+    display: flex; align-items: center; gap: 10px;
+  }
+  #topbar .brand .mark {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    display: grid; place-items: center;
+    color: #fff; font-weight: 800; letter-spacing: 0.5px;
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset;
+  }
+  #topbar h1 {
+    font-family: var(--serif);
+    font-weight: 700;
+    font-size: 16px;
+    margin: 0;
+    letter-spacing: 0.4px;
+  }
+  #topbar .sub {
+    font-size: 11px; color: var(--text-2);
+    text-transform: uppercase; letter-spacing: 1.4px;
+  }
+  #topbar .spacer { flex: 1; }
+  #topbar .status {
+    display: flex; align-items: center; gap: 14px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--text-1);
+  }
+  #topbar .status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ok); box-shadow: 0 0 6px var(--ok);
+    margin-right: 6px; display: inline-block;
+    animation: pulse 2.4s infinite;
+  }
+  #topbar .status .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  #topbar .status .dot.err  { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+
+  /* ---------- Search box in topbar ---------- */
+  .searchbox {
+    display: flex; align-items: center;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 4px 8px;
+    width: 280px;
+    transition: border-color .15s ease;
+  }
+  .searchbox:focus-within { border-color: var(--accent); }
+  .searchbox input {
+    background: transparent; border: 0; outline: none; color: var(--text-0);
+    font-family: var(--mono); font-size: 12px;
+    width: 100%;
+  }
+  .searchbox svg { width: 14px; height: 14px; color: var(--text-2); margin-right: 6px; flex: none; }
+
+  #searchResults {
+    position: absolute;
+    top: 50px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    width: 280px;
+    max-height: 240px; overflow: auto;
+    z-index: 1100;
+    display: none;
+  }
+  #searchResults div {
+    padding: 8px 10px; cursor: pointer; font-size: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  #searchResults div:hover { background: var(--bg-3); }
+
+  /* ---------- Layout ---------- */
+  #map {
+    position: fixed;
+    top: 56px; left: 280px; right: 360px; bottom: 0;
+    background: var(--bg-0);
+  }
+
+  /* ---------- Left panel ---------- */
+  #left-panel {
+    position: fixed;
+    top: 56px; left: 0; bottom: 0;
+    width: 280px;
+    background: var(--bg-1);
+    border-right: 1px solid var(--line);
+    overflow: auto;
+    z-index: 500;
+  }
+  /* ---------- Right panel ---------- */
+  #right-panel {
+    position: fixed;
+    top: 56px; right: 0; bottom: 0;
+    width: 360px;
+    background: var(--bg-1);
+    border-left: 1px solid var(--line);
+    overflow: auto;
+    z-index: 500;
+  }
+
+  .panel-section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .panel-section h2 {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.6px;
+    color: var(--text-2);
+    margin: 0 0 10px 0;
+    font-weight: 700;
+  }
+  .panel-section h3 {
+    font-size: 13px;
+    margin: 0 0 6px 0;
+    font-family: var(--serif);
+    font-weight: 700;
+  }
+
+  /* ---------- Layer toggles ---------- */
+  .layer-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .layer-row:hover { color: #fff; }
+  .layer-row .swatch {
+    width: 14px; height: 14px; border-radius: 3px;
+    background: var(--line-2); flex: none;
+    border: 1px solid var(--line);
+    display: grid; place-items: center;
+  }
+  .layer-row .swatch.on { background: var(--accent); border-color: var(--accent); }
+  .layer-row .swatch.on::after {
+    content: ""; width: 6px; height: 6px; background: #fff; border-radius: 1px;
+  }
+  .layer-row .label { font-size: 12.5px; color: var(--text-1); }
+  .layer-row.active .label { color: var(--text-0); }
+  .layer-row .count {
+    margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-2);
+  }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 12px;
+    background: var(--bg-3);
+    border: 1px solid var(--line-2);
+    color: var(--text-0);
+    border-radius: 4px;
+    font-family: var(--sans); font-size: 12px;
+    cursor: pointer;
+    letter-spacing: 0.4px;
+    text-transform: uppercase; font-weight: 600;
+    transition: background .15s ease, border-color .15s ease, transform .05s ease;
+  }
+  .btn:hover { background: #243245; border-color: #36465e; }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn.primary:hover { background: #ec2731; border-color: #ec2731; }
+  .btn.ghost {
+    background: transparent;
+  }
+
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row .btn { flex: 1; }
+
+  /* ---------- Briefing card ---------- */
+  .briefing {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--text-1);
+    white-space: pre-wrap;
+    max-height: 460px;
+    overflow: auto;
+  }
+  .briefing strong { color: var(--text-0); }
+  .briefing .h {
+    color: var(--accent-2);
+    text-transform: uppercase; letter-spacing: 1.2px;
+    font-weight: 700; font-size: 10.5px;
+    display: block; margin-top: 8px; margin-bottom: 2px;
+  }
+  .briefing .h:first-child { margin-top: 0; }
+
+  /* ---------- KPI tiles ---------- */
+  .kpi-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .kpi {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 10px;
+  }
+  .kpi .v {
+    font-family: var(--serif);
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-0);
+    line-height: 1.1;
+  }
+  .kpi .k {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--text-2);
+    margin-top: 4px;
+  }
+
+  /* ---------- Severity pills ---------- */
+  .pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-right: 4px;
+  }
+  .pill.extreme  { background: var(--extreme);  color: #fff; }
+  .pill.severe   { background: var(--severe);   color: #fff; }
+  .pill.moderate { background: var(--moderate); color: #1a1a1a; }
+  .pill.minor    { background: var(--minor);    color: #1a1a1a; }
+  .pill.unknown  { background: var(--unknown);  color: #fff; }
+
+  /* ---------- Gap list ---------- */
+  .gap-list { display: flex; flex-direction: column; gap: 8px; }
+  .gap-item {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 10px;
+    cursor: pointer;
+    transition: background .15s ease;
+  }
+  .gap-item:hover { background: var(--bg-3); }
+  .gap-item .t { font-weight: 700; font-size: 12px; color: var(--text-0); }
+  .gap-item .d { font-size: 11px; color: var(--text-2); margin-top: 3px; }
+  .gap-item .score {
+    font-family: var(--mono); font-size: 10px; color: var(--accent-2);
+    margin-top: 4px;
+  }
+
+  /* ---------- Leaflet overrides ---------- */
+  .leaflet-container { background: #050810 !important; font-family: var(--sans) !important; }
+  .leaflet-control-zoom a {
+    background: var(--bg-2) !important;
+    color: var(--text-0) !important;
+    border: 1px solid var(--line) !important;
+  }
+  .leaflet-control-zoom a:hover { background: var(--bg-3) !important; }
+  .leaflet-control-attribution {
+    background: rgba(10,14,20,0.7) !important;
+    color: var(--text-2) !important;
+    font-size: 10px !important;
+  }
+  .leaflet-control-attribution a { color: var(--text-1) !important; }
+  .leaflet-popup-content-wrapper {
+    background: var(--bg-2);
+    color: var(--text-0);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+  }
+  .leaflet-popup-tip { background: var(--bg-2); }
+  .leaflet-popup-content {
+    margin: 10px 12px;
+    font-size: 12px; line-height: 1.5;
+  }
+  .leaflet-popup-content .pt {
+    font-family: var(--serif); font-size: 13px; font-weight: 700; margin-bottom: 4px;
+  }
+  .leaflet-popup-content .pl {
+    color: var(--text-2); font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px;
+  }
+
+  /* ---------- Pulsing markers ---------- */
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(215,32,39,0.55); }
+    70%  { box-shadow: 0 0 0 14px rgba(215,32,39,0); }
+    100% { box-shadow: 0 0 0 0 rgba(215,32,39,0); }
+  }
+  .pulse-dot {
+    width: 14px; height: 14px;
+    background: var(--accent);
+    border: 2px solid #fff;
+    border-radius: 50%;
+    animation: pulse 1.8s infinite;
+  }
+
+  /* SVG icon containers */
+  .infra-icon {
+    width: 28px; height: 28px;
+    display: grid; place-items: center;
+    background: var(--bg-2);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+  }
+  .infra-icon svg { width: 16px; height: 16px; }
+  .infra-icon.shelter   { border-color: #4ade80; }
+  .infra-icon.hospital  { border-color: #60a5fa; }
+  .infra-icon.fire      { border-color: #f5a623; }
+  .infra-icon.logistics { border-color: #c084fc; }
+  .infra-icon.shelter   svg { color: #4ade80; }
+  .infra-icon.hospital  svg { color: #60a5fa; }
+  .infra-icon.fire      svg { color: #f5a623; }
+  .infra-icon.logistics svg { color: #c084fc; }
+
+  /* Mobile */
+  @media (max-width: 1100px) {
+    #left-panel  { width: 240px; }
+    #right-panel { width: 320px; }
+    #map { left: 240px; right: 320px; }
+    .searchbox { width: 200px; }
+  }
+  @media (max-width: 820px) {
+    #left-panel, #right-panel {
+      position: fixed; top: auto; bottom: 0; left: 0; right: 0;
+      width: 100%; height: 38vh;
+      border: 0; border-top: 1px solid var(--line);
+      z-index: 1500;
+    }
+    #right-panel { display: none; }
+    #map { left: 0; right: 0; bottom: 38vh; }
+    #topbar h1 { font-size: 14px; }
+    #topbar .sub { display: none; }
+    .searchbox { width: 140px; }
+  }
+
+  /* Loading */
+  #loading {
+    position: fixed; inset: 0;
+    background: rgba(10,14,20,0.92);
+    display: grid; place-items: center;
+    z-index: 9999;
+    transition: opacity .4s ease;
+  }
+  #loading .lbox {
+    text-align: center;
+    font-family: var(--mono);
+    color: var(--text-1);
+    letter-spacing: 1px;
+  }
+  #loading .bar {
+    width: 220px; height: 3px;
+    background: var(--bg-3);
+    border-radius: 2px; overflow: hidden; margin: 14px auto 0;
+  }
+  #loading .bar::after {
+    content: ""; display: block; width: 30%; height: 100%;
+    background: var(--accent);
+    animation: slide 1.2s infinite;
+  }
+  @keyframes slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(360%); }
+  }
+</style>
+</head>
+
+<body>
+
+<div id="loading">
+  <div class="lbox">
+    <div style="font-family: var(--serif); font-size: 18px; color: var(--text-0); letter-spacing: 0.5px;">
+      FINAL MILE INTELLIGENCE
+    </div>
+    <div style="margin-top: 6px; font-size: 11px;">INITIALIZING OPERATIONAL LAYERS</div>
+    <div class="bar"></div>
+  </div>
+</div>
+
+<!-- ============================ TOP BAR ============================ -->
+<div id="topbar">
+  <div class="brand">
+    <div class="mark">+</div>
+    <div>
+      <h1>FINAL MILE INTELLIGENCE MAP</h1>
+      <div class="sub">Live hazards · infrastructure gaps · AI-assisted operational context</div>
+    </div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div style="position: relative;">
+    <div class="searchbox">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+      </svg>
+      <input id="searchInput" type="text" placeholder="Search a place..." autocomplete="off" />
+    </div>
+    <div id="searchResults"></div>
+  </div>
+
+  <div class="status">
+    <span><span class="dot" id="statusNws"></span><span id="statusNwsTxt">NWS</span></span>
+    <span><span class="dot" id="statusInfra"></span><span id="statusInfraTxt">INFRA</span></span>
+    <span><span class="dot" id="statusAi"></span><span id="statusAiTxt">AI</span></span>
+  </div>
+</div>
+
+<!-- ============================ LEFT PANEL ============================ -->
+<aside id="left-panel">
+
+  <div class="panel-section">
+    <h2>Operational Layers</h2>
+    <div class="layer-row active" data-layer="alerts">
+      <div class="swatch on"></div>
+      <div class="label">NWS Active Alerts</div>
+      <div class="count" id="cnt-alerts">--</div>
+    </div>
+    <div class="layer-row active" data-layer="shelters">
+      <div class="swatch on" style="background:#4ade80;border-color:#4ade80;"></div>
+      <div class="label">Shelters</div>
+      <div class="count" id="cnt-shelter">0</div>
+    </div>
+    <div class="layer-row active" data-layer="hospitals">
+      <div class="swatch on" style="background:#60a5fa;border-color:#60a5fa;"></div>
+      <div class="label">Hospitals</div>
+      <div class="count" id="cnt-hospital">0</div>
+    </div>
+    <div class="layer-row active" data-layer="fire">
+      <div class="swatch on" style="background:#f5a623;border-color:#f5a623;"></div>
+      <div class="label">Fire Stations</div>
+      <div class="count" id="cnt-fire">0</div>
+    </div>
+    <div class="layer-row active" data-layer="logistics">
+      <div class="swatch on" style="background:#c084fc;border-color:#c084fc;"></div>
+      <div class="label">Logistics / Staging</div>
+      <div class="count" id="cnt-logistics">0</div>
+    </div>
+    <div class="layer-row active" data-layer="risk">
+      <div class="swatch on" style="background:#ec2731;border-color:#ec2731;"></div>
+      <div class="label">Risk Surface (demo)</div>
+    </div>
+    <div class="layer-row active" data-layer="arcs">
+      <div class="swatch on" style="background:#60a5fa;border-color:#60a5fa;"></div>
+      <div class="label">Resource Movement</div>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>Severity Legend</h2>
+    <div style="display:flex;flex-wrap:wrap;gap:4px;">
+      <span class="pill extreme">Extreme</span>
+      <span class="pill severe">Severe</span>
+      <span class="pill moderate">Moderate</span>
+      <span class="pill minor">Minor</span>
+      <span class="pill unknown">Unknown</span>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>Snapshot</h2>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="v" id="kpiAlerts">--</div><div class="k">Active alerts</div></div>
+      <div class="kpi"><div class="v" id="kpiExtreme">--</div><div class="k">Extreme / severe</div></div>
+      <div class="kpi"><div class="v" id="kpiInfra">--</div><div class="k">Infra in view</div></div>
+      <div class="kpi"><div class="v" id="kpiGaps">--</div><div class="k">Coverage gaps</div></div>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>Actions</h2>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button class="btn primary" id="btnBriefing">Generate AI Briefing</button>
+      <div class="btn-row">
+        <button class="btn" id="btnGaps">Find Gaps</button>
+        <button class="btn ghost" id="btnRefresh">Refresh NWS</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>About</h2>
+    <div style="font-size:11px;color:var(--text-2);line-height:1.55;">
+      Operational prototype. NWS alerts are live. Infrastructure and risk are
+      labeled demo unless replaced with authoritative sources. No phone numbers
+      are fabricated.
+    </div>
+  </div>
+
+</aside>
+
+<!-- ============================ MAP ============================ -->
+<div id="map"></div>
+
+<!-- ============================ RIGHT PANEL ============================ -->
+<aside id="right-panel">
+  <div class="panel-section">
+    <h2>Operational Briefing</h2>
+    <div class="briefing" id="briefing">
+<span class="h">SITUATION</span>
+Click anywhere on the map to capture a point of interest, or click a weather alert polygon to focus on it. Then press <strong>Generate AI Briefing</strong>.
+
+<span class="h">CONTEXT</span>
+This panel will summarize hazards, nearby infrastructure, coverage gaps, and recommended first actions for the selected location.
+
+<span class="h">DATA CONFIDENCE</span>
+Live: NWS active alerts.
+Demo: infrastructure points, risk surface.
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>Top Coverage Gaps</h2>
+    <div class="gap-list" id="gapList">
+      <div style="font-size:11.5px;color:var(--text-2);">
+        Press <strong style="color:var(--text-1);">Find Gaps</strong> to identify the top
+        5 areas with high risk, no nearby shelter, and active weather alerts.
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <h2>Selected Point</h2>
+    <div id="selectedPoint" style="font-family:var(--mono);font-size:11px;color:var(--text-2);">
+      No point selected.
+    </div>
+  </div>
+</aside>
+
+
+<script>
+/* ============================================================================
+   LIGHTRAG CONFIG  (flip enabled to true once your local server is running)
+   ============================================================================ */
+const LIGHTRAG_CONFIG = {
+  enabled: false,
+  endpoint: "http://localhost:8020/query",
+  mode: "hybrid"  // "naive" | "local" | "global" | "hybrid"
+};
+
+async function queryLightRAG(question, context) {
+  if (!LIGHTRAG_CONFIG.enabled) return null;
+
+  const payload = {
+    query: question + "\n\nMAP CONTEXT:\n" + JSON.stringify(context, null, 2),
+    mode: LIGHTRAG_CONFIG.mode,
+    only_need_context: false
+  };
+
+  const response = await fetch(LIGHTRAG_CONFIG.endpoint, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) throw new Error("LightRAG query failed");
+  return await response.json();
+}
+
+/* ============================================================================
+   DEMO_INFRASTRUCTURE  (replace with real data from your feature service)
+   No phone numbers fabricated.
+   ============================================================================ */
+const DEMO_INFRASTRUCTURE = [
+  // Shelters
+  { type: "shelter",   name: "Houston Convention Shelter",  city: "Houston, TX",     lat: 29.7521, lng: -95.3592, capacity: 1200 },
+  { type: "shelter",   name: "Galveston Community Center",  city: "Galveston, TX",   lat: 29.3013, lng: -94.7977, capacity: 380  },
+  { type: "shelter",   name: "Baton Rouge Civic Shelter",   city: "Baton Rouge, LA", lat: 30.4515, lng: -91.1871, capacity: 700  },
+  { type: "shelter",   name: "New Orleans East Shelter",    city: "New Orleans, LA", lat: 30.0322, lng: -89.9514, capacity: 540  },
+  { type: "shelter",   name: "Mobile Coliseum Shelter",     city: "Mobile, AL",      lat: 30.6954, lng: -88.0399, capacity: 620  },
+  { type: "shelter",   name: "Tampa Bay Shelter",           city: "Tampa, FL",       lat: 27.9506, lng: -82.4572, capacity: 800  },
+  { type: "shelter",   name: "Orlando Regional Shelter",    city: "Orlando, FL",     lat: 28.5383, lng: -81.3792, capacity: 950  },
+  { type: "shelter",   name: "Miami North Shelter",         city: "Miami, FL",       lat: 25.7617, lng: -80.1918, capacity: 1100 },
+  { type: "shelter",   name: "Charleston Coastal Shelter",  city: "Charleston, SC",  lat: 32.7765, lng: -79.9311, capacity: 460  },
+  { type: "shelter",   name: "Wilmington Civic Shelter",    city: "Wilmington, NC",  lat: 34.2257, lng: -77.9447, capacity: 320  },
+  { type: "shelter",   name: "Raleigh Reg. Shelter",        city: "Raleigh, NC",     lat: 35.7796, lng: -78.6382, capacity: 690  },
+  { type: "shelter",   name: "Norfolk Bay Shelter",         city: "Norfolk, VA",     lat: 36.8508, lng: -76.2859, capacity: 410  },
+  { type: "shelter",   name: "OKC Metro Shelter",           city: "Oklahoma City, OK", lat: 35.4676, lng: -97.5164, capacity: 720 },
+  { type: "shelter",   name: "Tulsa Civic Shelter",         city: "Tulsa, OK",       lat: 36.1540, lng: -95.9928, capacity: 540  },
+  { type: "shelter",   name: "Memphis Riverfront Shelter",  city: "Memphis, TN",     lat: 35.1495, lng: -90.0490, capacity: 600  },
+
+  // Hospitals
+  { type: "hospital",  name: "Texas Medical Center",        city: "Houston, TX",     lat: 29.7100, lng: -95.4015, capacity: 7600 },
+  { type: "hospital",  name: "UTMB Galveston",              city: "Galveston, TX",   lat: 29.3091, lng: -94.7746, capacity: 600  },
+  { type: "hospital",  name: "Our Lady of the Lake",        city: "Baton Rouge, LA", lat: 30.4060, lng: -91.0959, capacity: 800  },
+  { type: "hospital",  name: "Ochsner Medical",             city: "New Orleans, LA", lat: 29.9395, lng: -90.1240, capacity: 770  },
+  { type: "hospital",  name: "USA Health Univ. Hospital",   city: "Mobile, AL",      lat: 30.6837, lng: -88.1689, capacity: 410  },
+  { type: "hospital",  name: "Tampa General Hospital",      city: "Tampa, FL",       lat: 27.9381, lng: -82.4593, capacity: 1040 },
+  { type: "hospital",  name: "Orlando Health",              city: "Orlando, FL",     lat: 28.5290, lng: -81.3787, capacity: 880  },
+  { type: "hospital",  name: "Jackson Memorial",            city: "Miami, FL",       lat: 25.7906, lng: -80.2126, capacity: 1500 },
+  { type: "hospital",  name: "MUSC Charleston",             city: "Charleston, SC",  lat: 32.7841, lng: -79.9470, capacity: 700  },
+  { type: "hospital",  name: "Novant New Hanover",          city: "Wilmington, NC",  lat: 34.2197, lng: -77.9098, capacity: 600  },
+  { type: "hospital",  name: "Duke University Hospital",    city: "Durham, NC",      lat: 36.0070, lng: -78.9389, capacity: 950  },
+  { type: "hospital",  name: "Sentara Norfolk General",     city: "Norfolk, VA",     lat: 36.8585, lng: -76.3061, capacity: 525  },
+  { type: "hospital",  name: "OU Medical Center",           city: "Oklahoma City, OK", lat: 35.4733, lng: -97.4905, capacity: 700 },
+  { type: "hospital",  name: "Methodist Le Bonheur",        city: "Memphis, TN",     lat: 35.1486, lng: -90.0307, capacity: 600  },
+
+  // Fire stations
+  { type: "fire", name: "HFD Station 8",  city: "Houston, TX",      lat: 29.7400, lng: -95.3700 },
+  { type: "fire", name: "HFD Station 18", city: "Houston, TX",      lat: 29.7800, lng: -95.4200 },
+  { type: "fire", name: "GFD Central",    city: "Galveston, TX",    lat: 29.3050, lng: -94.7900 },
+  { type: "fire", name: "BRFD Station 1", city: "Baton Rouge, LA",  lat: 30.4470, lng: -91.1880 },
+  { type: "fire", name: "NOFD Engine 17", city: "New Orleans, LA",  lat: 29.9620, lng: -90.0880 },
+  { type: "fire", name: "MFD Station 4",  city: "Mobile, AL",       lat: 30.6900, lng: -88.0500 },
+  { type: "fire", name: "TFR Station 1",  city: "Tampa, FL",        lat: 27.9510, lng: -82.4630 },
+  { type: "fire", name: "OFD Station 1",  city: "Orlando, FL",      lat: 28.5390, lng: -81.3800 },
+  { type: "fire", name: "MFR Station 2",  city: "Miami, FL",        lat: 25.7740, lng: -80.1900 },
+  { type: "fire", name: "CFD Station 4",  city: "Charleston, SC",   lat: 32.7860, lng: -79.9400 },
+  { type: "fire", name: "WFD Station 1",  city: "Wilmington, NC",   lat: 34.2360, lng: -77.9450 },
+  { type: "fire", name: "RFD Station 1",  city: "Raleigh, NC",      lat: 35.7790, lng: -78.6390 },
+  { type: "fire", name: "NFD Station 1",  city: "Norfolk, VA",      lat: 36.8550, lng: -76.2900 },
+  { type: "fire", name: "OKCFD Station 1",city: "Oklahoma City, OK",lat: 35.4670, lng: -97.5170 },
+  { type: "fire", name: "MFD Station 3",  city: "Memphis, TN",      lat: 35.1480, lng: -90.0490 },
+
+  // Logistics / staging
+  { type: "logistics", name: "Gulf Coast Staging Yard",   city: "Houston, TX",      lat: 29.6850, lng: -95.2470, capacity: "200 pallets" },
+  { type: "logistics", name: "I-10 Forward Staging",      city: "Lake Charles, LA", lat: 30.2266, lng: -93.2174, capacity: "150 pallets" },
+  { type: "logistics", name: "ARC Regional Warehouse",    city: "Birmingham, AL",   lat: 33.5186, lng: -86.8104, capacity: "400 pallets" },
+  { type: "logistics", name: "I-75 Staging Hub",          city: "Lake City, FL",    lat: 30.1898, lng: -82.6393, capacity: "180 pallets" },
+  { type: "logistics", name: "Atlanta Distribution",      city: "Atlanta, GA",      lat: 33.7490, lng: -84.3880, capacity: "600 pallets" },
+  { type: "logistics", name: "Carolinas Forward Hub",     city: "Charlotte, NC",    lat: 35.2271, lng: -80.8431, capacity: "350 pallets" },
+  { type: "logistics", name: "Mid-Atlantic Staging",      city: "Richmond, VA",     lat: 37.5407, lng: -77.4360, capacity: "300 pallets" },
+  { type: "logistics", name: "South Plains Staging",      city: "Dallas, TX",       lat: 32.7767, lng: -96.7970, capacity: "500 pallets" }
+];
+
+/* ============================================================================
+   STATE
+   ============================================================================ */
+const STATE = {
+  alerts: [],
+  alertLayer: null,
+  riskHeat: null,
+  arcsLayer: null,
+  pulseLayer: null,
+  cluster: null,
+  layerVisible: { alerts: true, shelters: true, hospitals: true, fire: true, logistics: true, risk: true, arcs: true },
+  selected: null, // {lat, lng}
+  selectedAlert: null,
+  deck: null,
+  deckOk: false
+};
+
+/* ============================================================================
+   MAP
+   ============================================================================ */
+const map = L.map('map', {
+  zoomControl: true,
+  attributionControl: true,
+  preferCanvas: true,
+  worldCopyJump: true
+}).setView([31.5, -89.0], 5);
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap &copy; CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19
+}).addTo(map);
+
+/* ============================================================================
+   ICON FACTORY
+   ============================================================================ */
+const SVG = {
+  shelter:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/></svg>',
+  hospital: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M12 8v8M8 12h8"/></svg>',
+  fire:     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s4 4 4 8a4 4 0 0 1-8 0c0-2 1-3 1-3s-1 5 3 5"/><path d="M12 21c-4 0-7-3-7-6 0-3 3-5 3-5"/></svg>',
+  logistics:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="13" height="10" rx="1"/><path d="M16 10h4l1 3v4h-5z"/><circle cx="7" cy="18" r="1.6"/><circle cx="17" cy="18" r="1.6"/></svg>'
+};
+
+function infraIcon(type) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="infra-icon ${type}">${SVG[type] || ''}</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -14]
+  });
+}
+
+function pulseIcon() {
+  return L.divIcon({
+    className: '',
+    html: `<div class="pulse-dot"></div>`,
+    iconSize: [14, 14],
+    iconAnchor: [7, 7]
+  });
+}
+
+/* ============================================================================
+   INFRASTRUCTURE LAYER (clustering w/ fallback)
+   ============================================================================ */
+let useCluster = typeof L.markerClusterGroup === "function";
+const infraGroups = { shelter: [], hospital: [], fire: [], logistics: [] };
+const infraMarkers = [];
+
+(function buildInfra() {
+  const cluster = useCluster
+    ? L.markerClusterGroup({
+        chunkedLoading: true,
+        showCoverageOnHover: false,
+        spiderfyOnMaxZoom: true,
+        maxClusterRadius: 50,
+        iconCreateFunction: (c) => L.divIcon({
+          html: `<div style="
+            background: rgba(215,32,39,0.85);
+            color:#fff;
+            width:36px;height:36px;border-radius:50%;
+            display:grid;place-items:center;
+            font-family:var(--mono);font-size:12px;font-weight:700;
+            border:2px solid #fff;box-shadow:0 4px 10px rgba(0,0,0,0.5);
+          ">${c.getChildCount()}</div>`,
+          className: '',
+          iconSize: [36, 36]
+        })
+      })
+    : L.layerGroup();
+
+  DEMO_INFRASTRUCTURE.forEach(p => {
+    const m = L.marker([p.lat, p.lng], { icon: infraIcon(p.type) });
+    const cap = p.capacity != null ? `<div><span class="pl">Capacity</span> ${p.capacity}</div>` : '';
+    m.bindPopup(`
+      <div class="pt">${escapeHtml(p.name)}</div>
+      <div><span class="pl">Type</span> ${p.type}</div>
+      <div><span class="pl">City</span> ${escapeHtml(p.city)}</div>
+      ${cap}
+      <div style="margin-top:6px;font-size:10.5px;color:var(--text-2);">Demo infrastructure point.</div>
+    `);
+    m.feature = p;
+    infraGroups[p.type].push(m);
+    infraMarkers.push(m);
+    cluster.addLayer(m);
+  });
+
+  STATE.cluster = cluster;
+  cluster.addTo(map);
+
+  document.getElementById('cnt-shelter').textContent   = infraGroups.shelter.length;
+  document.getElementById('cnt-hospital').textContent  = infraGroups.hospital.length;
+  document.getElementById('cnt-fire').textContent      = infraGroups.fire.length;
+  document.getElementById('cnt-logistics').textContent = infraGroups.logistics.length;
+  setStatus('statusInfra', 'ok', `INFRA ${DEMO_INFRASTRUCTURE.length}`);
+})();
+
+/* ============================================================================
+   PULSING CRITICAL POINTS (a small subset of staging+major hospitals)
+   ============================================================================ */
+const pulseLayer = L.layerGroup().addTo(map);
+DEMO_INFRASTRUCTURE
+  .filter(p => p.type === 'logistics' || (p.type === 'hospital' && p.capacity > 800))
+  .forEach(p => {
+    L.marker([p.lat, p.lng], { icon: pulseIcon(), interactive: false }).addTo(pulseLayer);
+  });
+STATE.pulseLayer = pulseLayer;
+
+/* ============================================================================
+   RISK SURFACE  (demo heat grid)
+   ============================================================================ */
+function buildRiskSurface() {
+  // Simulate a hurricane-belt style risk gradient along the Gulf+SE coast.
+  const seeds = [
+    { lat: 29.5, lng: -94.5, w: 0.95 }, // Houston/Galveston
+    { lat: 29.9, lng: -90.1, w: 0.95 }, // New Orleans
+    { lat: 30.4, lng: -88.0, w: 0.85 }, // Mobile
+    { lat: 27.9, lng: -82.5, w: 0.90 }, // Tampa
+    { lat: 25.8, lng: -80.2, w: 0.95 }, // Miami
+    { lat: 32.8, lng: -79.9, w: 0.80 }, // Charleston
+    { lat: 34.2, lng: -77.9, w: 0.75 }, // Wilmington
+    { lat: 36.8, lng: -76.3, w: 0.70 }, // Norfolk
+    { lat: 35.5, lng: -97.5, w: 0.80 }, // OK tornado alley
+    { lat: 35.1, lng: -90.0, w: 0.65 }  // Memphis
+  ];
+  const points = [];
+  seeds.forEach(s => {
+    for (let i = 0; i < 80; i++) {
+      const r = Math.random() * 1.6;
+      const a = Math.random() * Math.PI * 2;
+      const lat = s.lat + Math.cos(a) * r;
+      const lng = s.lng + Math.sin(a) * r * 1.3;
+      points.push([lat, lng, Math.max(0.05, s.w - r/2.4)]);
+    }
+  });
+  const heat = L.heatLayer(points, {
+    radius: 28, blur: 38, maxZoom: 9,
+    gradient: { 0.2: '#1e3a8a', 0.4: '#7c3aed', 0.6: '#ec4899', 0.8: '#f59e0b', 1.0: '#dc2626' }
+  });
+  heat.addTo(map);
+  STATE.riskHeat = heat;
+}
+buildRiskSurface();
+
+/* ============================================================================
+   RESOURCE MOVEMENT ARCS  (logistics -> nearest shelter)
+   ============================================================================ */
+function buildArcs() {
+  const arcs = L.layerGroup();
+  const logistics = DEMO_INFRASTRUCTURE.filter(p => p.type === 'logistics');
+  const shelters  = DEMO_INFRASTRUCTURE.filter(p => p.type === 'shelter');
+
+  logistics.forEach(l => {
+    // pick 2 nearest shelters
+    const sorted = shelters
+      .map(s => ({ s, d: haversine(l.lat, l.lng, s.lat, s.lng) }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, 2);
+    sorted.forEach(({ s }) => {
+      const curve = curvedLine([l.lat, l.lng], [s.lat, s.lng], 0.18);
+      const line = L.polyline(curve, {
+        color: '#60a5fa',
+        weight: 1.4,
+        opacity: 0.6,
+        dashArray: '4 6'
+      });
+      arcs.addLayer(line);
+    });
+  });
+  arcs.addTo(map);
+  STATE.arcsLayer = arcs;
+}
+buildArcs();
+
+/* ============================================================================
+   DECK.GL OVERLAY (best effort; falls back silently)
+   ============================================================================ */
+function tryDeckGL() {
+  try {
+    if (!window.deck || !deck.LeafletLayer) return false;
+
+    const scatter = new deck.ScatterplotLayer({
+      id: 'pulse-scatter',
+      data: DEMO_INFRASTRUCTURE.filter(p => p.type === 'logistics' || (p.type === 'hospital' && p.capacity > 800)),
+      getPosition: d => [d.lng, d.lat],
+      getRadius: 14000,
+      getFillColor: d => d.type === 'logistics' ? [192, 132, 252, 110] : [96, 165, 250, 110],
+      stroked: true, lineWidthMinPixels: 1,
+      getLineColor: [255, 255, 255, 200],
+      pickable: false,
+      radiusUnits: 'meters'
+    });
+
+    const arcsData = [];
+    const logistics = DEMO_INFRASTRUCTURE.filter(p => p.type === 'logistics');
+    const shelters  = DEMO_INFRASTRUCTURE.filter(p => p.type === 'shelter');
+    logistics.forEach(l => {
+      shelters
+        .map(s => ({ s, d: haversine(l.lat, l.lng, s.lat, s.lng) }))
+        .sort((a,b)=>a.d-b.d).slice(0,2).forEach(({s}) => {
+          arcsData.push({ from: [l.lng, l.lat], to: [s.lng, s.lat] });
+        });
+    });
+
+    const arc = new deck.ArcLayer({
+      id: 'arcs',
+      data: arcsData,
+      getSourcePosition: d => d.from,
+      getTargetPosition: d => d.to,
+      getSourceColor: [192, 132, 252, 200],
+      getTargetColor: [76, 222, 128, 200],
+      getWidth: 1.5
+    });
+
+    const layer = new deck.LeafletLayer({ layers: [scatter, arc] });
+    map.addLayer(layer);
+    STATE.deck = layer;
+    STATE.deckOk = true;
+    // Hide the pulse + arc fallback layers when deck is up
+    map.removeLayer(STATE.pulseLayer);
+    map.removeLayer(STATE.arcsLayer);
+    return true;
+  } catch (e) {
+    console.warn('deck.gl unavailable, using Leaflet fallback:', e);
+    return false;
+  }
+}
+tryDeckGL();
+
+/* ============================================================================
+   NWS ALERTS
+   ============================================================================ */
+async function loadNwsAlerts() {
+  setStatus('statusNws', 'warn', 'NWS …');
+  try {
+    const resp = await fetch('https://api.weather.gov/alerts/active', {
+      headers: { 'Accept': 'application/geo+json' }
+    });
+    if (!resp.ok) throw new Error('NWS HTTP ' + resp.status);
+    const data = await resp.json();
+    renderAlerts(data);
+    setStatus('statusNws', 'ok', `NWS ${data.features.length}`);
+  } catch (e) {
+    console.warn('NWS load failed:', e);
+    setStatus('statusNws', 'err', 'NWS offline');
+    document.getElementById('cnt-alerts').textContent = '!';
+  }
+}
+
+function renderAlerts(geojson) {
+  if (STATE.alertLayer) map.removeLayer(STATE.alertLayer);
+  STATE.alerts = (geojson.features || []).filter(f => f.geometry);
+
+  const layer = L.geoJSON(geojson, {
+    filter: f => f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'),
+    style: f => severityStyle(f.properties && f.properties.severity),
+    onEachFeature: (f, lyr) => {
+      const p = f.properties || {};
+      lyr.bindPopup(`
+        <div class="pt">${escapeHtml(p.event || 'Weather Alert')}</div>
+        <div><span class="pl">Severity</span>
+          <span class="pill ${(p.severity||'unknown').toLowerCase()}">${escapeHtml(p.severity||'Unknown')}</span></div>
+        <div style="margin-top:6px;">${escapeHtml(p.headline || '')}</div>
+        <div style="margin-top:6px;font-size:11px;color:var(--text-2);">
+          <div><span class="pl">Area</span> ${escapeHtml(truncate(p.areaDesc || '', 220))}</div>
+          <div><span class="pl">Effective</span> ${formatTime(p.effective)}</div>
+          <div><span class="pl">Expires</span> ${formatTime(p.expires)}</div>
+        </div>
+      `);
+      lyr.on('click', () => {
+        STATE.selectedAlert = p;
+        updateSelectedPointFromAlert(p);
+      });
+    }
+  });
+
+  layer.addTo(map);
+  STATE.alertLayer = layer;
+
+  // KPI counts
+  const polyCount = STATE.alerts.filter(f =>
+    f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon')).length;
+  const extreme = STATE.alerts.filter(f => {
+    const s = (f.properties && f.properties.severity || '').toLowerCase();
+    return s === 'extreme' || s === 'severe';
+  }).length;
+  document.getElementById('cnt-alerts').textContent = polyCount;
+  document.getElementById('kpiAlerts').textContent  = STATE.alerts.length;
+  document.getElementById('kpiExtreme').textContent = extreme;
+  updateInViewKpi();
+}
+
+function severityStyle(sev) {
+  const s = (sev || '').toLowerCase();
+  const map = {
+    extreme:  { color: '#fff', fillColor: getCss('--extreme'),  weight: 1, fillOpacity: 0.45 },
+    severe:   { color: '#fff', fillColor: getCss('--severe'),   weight: 1, fillOpacity: 0.35 },
+    moderate: { color: '#fff', fillColor: getCss('--moderate'), weight: 1, fillOpacity: 0.30 },
+    minor:    { color: '#fff', fillColor: getCss('--minor'),    weight: 1, fillOpacity: 0.25 }
+  };
+  return map[s] || { color: '#fff', fillColor: getCss('--unknown'), weight: 0.6, fillOpacity: 0.18 };
+}
+
+loadNwsAlerts();
+
+/* ============================================================================
+   MAP CLICK → nearest analysis + briefing context
+   ============================================================================ */
+map.on('click', (e) => {
+  // Ignore clicks that hit overlays (popups handle their own)
+  STATE.selected = { lat: e.latlng.lat, lng: e.latlng.lng };
+  STATE.selectedAlert = null;
+  updateSelectedPoint();
+});
+
+function updateSelectedPoint() {
+  const sp = document.getElementById('selectedPoint');
+  if (!STATE.selected) { sp.textContent = 'No point selected.'; return; }
+  const { lat, lng } = STATE.selected;
+  const ctx = analyzeContext(lat, lng);
+  sp.innerHTML = `
+    <div><strong style="color:var(--text-0);">${lat.toFixed(4)}, ${lng.toFixed(4)}</strong></div>
+    <div style="margin-top:4px;">Nearest shelter:&nbsp;${ctx.nearestShelter ? escapeHtml(ctx.nearestShelter.name) + ` <span style="color:var(--text-2);">(${ctx.nearestShelter._km.toFixed(1)} km)</span>` : '—'}</div>
+    <div>Nearest hospital:&nbsp;${ctx.nearestHospital ? escapeHtml(ctx.nearestHospital.name) + ` <span style="color:var(--text-2);">(${ctx.nearestHospital._km.toFixed(1)} km)</span>` : '—'}</div>
+    <div>Shelters &lt;50 km:&nbsp;${ctx.sheltersWithin50}</div>
+    <div>Hospitals &lt;50 km:&nbsp;${ctx.hospitalsWithin50}</div>
+    <div>Active alerts here:&nbsp;${ctx.alertsHere.length}</div>
+  `;
+}
+
+function updateSelectedPointFromAlert(p) {
+  STATE.selected = null;
+  const sp = document.getElementById('selectedPoint');
+  sp.innerHTML = `
+    <div><strong style="color:var(--text-0);">Alert:</strong> ${escapeHtml(p.event || 'Weather Alert')}</div>
+    <div>Severity: <span class="pill ${(p.severity||'unknown').toLowerCase()}">${escapeHtml(p.severity||'Unknown')}</span></div>
+    <div style="margin-top:4px;color:var(--text-1);">${escapeHtml(truncate(p.headline||'', 220))}</div>
+    <div style="margin-top:4px;color:var(--text-2);">${escapeHtml(truncate(p.areaDesc||'', 240))}</div>
+  `;
+
+  // Auto briefing-context update
+  const summary = `Hazard: ${p.event}. Severity: ${p.severity}. ${p.headline || ''}`;
+  setBriefing(buildHazardBriefing(p));
+}
+
+/* ============================================================================
+   ANALYSIS HELPERS
+   ============================================================================ */
+function analyzeContext(lat, lng) {
+  const enrich = (arr) => arr.map(p => ({ ...p, _km: haversine(lat, lng, p.lat, p.lng) }));
+  const shelters  = enrich(DEMO_INFRASTRUCTURE.filter(p => p.type === 'shelter')).sort((a,b)=>a._km-b._km);
+  const hospitals = enrich(DEMO_INFRASTRUCTURE.filter(p => p.type === 'hospital')).sort((a,b)=>a._km-b._km);
+  const fires     = enrich(DEMO_INFRASTRUCTURE.filter(p => p.type === 'fire')).sort((a,b)=>a._km-b._km);
+  const logi      = enrich(DEMO_INFRASTRUCTURE.filter(p => p.type === 'logistics')).sort((a,b)=>a._km-b._km);
+
+  const alertsHere = STATE.alerts.filter(f => featureContainsPoint(f, lat, lng));
+
+  return {
+    lat, lng,
+    nearestShelter:  shelters[0]  || null,
+    nearestHospital: hospitals[0] || null,
+    nearestFire:     fires[0]     || null,
+    nearestLogistics: logi[0]     || null,
+    sheltersWithin50:  shelters.filter(p => p._km < 50).length,
+    hospitalsWithin50: hospitals.filter(p => p._km < 50).length,
+    alertsHere
+  };
+}
+
+function featureContainsPoint(feature, lat, lng) {
+  // simple bounding-box test using Leaflet to avoid pulling turf
+  try {
+    const layer = L.geoJSON(feature);
+    const b = layer.getBounds();
+    if (!b.contains([lat, lng])) return false;
+    // refine: ray casting on first ring(s)
+    const polys = feature.geometry.type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+    for (const poly of polys) {
+      if (pointInRing(lat, lng, poly[0])) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+function pointInRing(lat, lng, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+                      (lng < (xj - xi) * (lat - yi) / ((yj - yi) || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function haversine(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) *
+            Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function curvedLine(a, b, bend) {
+  const steps = 36;
+  const mid = [(a[0]+b[0])/2, (a[1]+b[1])/2];
+  const dx = b[1]-a[1], dy = b[0]-a[0];
+  const off = [mid[0] - dx*bend, mid[1] + dy*bend];
+  const pts = [];
+  for (let t = 0; t <= 1; t += 1/steps) {
+    const u = 1 - t;
+    const lat = u*u*a[0] + 2*u*t*off[0] + t*t*b[0];
+    const lng = u*u*a[1] + 2*u*t*off[1] + t*t*b[1];
+    pts.push([lat, lng]);
+  }
+  return pts;
+}
+
+/* ============================================================================
+   BRIEFING (mock + LightRAG-ready)
+   ============================================================================ */
+function buildHazardBriefing(p) {
+  const sev = (p.severity || 'Unknown').toLowerCase();
+  const drivers = [];
+  if (/flood|surge|tide/i.test(p.event || '')) drivers.push('Flood / surge exposure');
+  if (/wind|hurricane|tropical|storm/i.test(p.event || '')) drivers.push('Wind / tropical storm exposure');
+  if (/tornado/i.test(p.event || '')) drivers.push('Tornadic risk to mobile structures');
+  if (/heat/i.test(p.event || '')) drivers.push('Heat health emergency');
+  if (/winter|ice|snow/i.test(p.event || '')) drivers.push('Winter / ice impacts on mobility');
+  if (drivers.length === 0) drivers.push('Hazard exposure (see NWS detail)');
+
+  return [
+    ['SITUATION',
+     `${p.event || 'Active weather alert'} (${p.severity || 'Unknown'} severity).\n${truncate(p.headline || '', 240)}`],
+    ['RISK DRIVERS', drivers.map(d => `- ${d}`).join('\n')],
+    ['INFRASTRUCTURE GAPS',
+     `- Confirm shelter readiness inside the alert footprint\n- Verify hospital diversion / surge posture\n- Validate logistics routes that cross the alert polygon`],
+    ['RECOMMENDED FIRST ACTIONS',
+     `- Notify chapter leadership in affected counties\n- Pre-stage response teams outside the polygon\n- Coordinate with EMA / NWS WFO for updates\n- Monitor expiration: ${formatTime(p.expires)}`],
+    ['DATA CONFIDENCE',
+     `High on hazard (NWS live).\nMedium on infrastructure (demo unless replaced).\nMedium on risk surface (demo).`],
+    ['NEXT CHECKS',
+     `- Re-pull NWS alerts every 5–10 min\n- Validate shelter status before deployment\n- Cross-reference with FEMA NRI for compounding risk`]
+  ];
+}
+
+function buildPointBriefing(ctx) {
+  const lines = [];
+  lines.push(['SITUATION',
+    `Selected point: ${ctx.lat.toFixed(3)}, ${ctx.lng.toFixed(3)}.\n` +
+    `${ctx.alertsHere.length} active NWS alert(s) intersect this location.`]);
+
+  const drivers = [];
+  ctx.alertsHere.slice(0, 3).forEach(a => drivers.push(`- ${a.properties.event} (${a.properties.severity})`));
+  if (ctx.sheltersWithin50 < 2) drivers.push('- Thin shelter coverage within 50 km');
+  if (ctx.hospitalsWithin50 < 2) drivers.push('- Limited hospital redundancy within 50 km');
+  if (drivers.length === 0) drivers.push('- No immediate drivers detected at this location');
+
+  lines.push(['RISK DRIVERS', drivers.join('\n')]);
+
+  const gaps = [];
+  if (ctx.nearestShelter && ctx.nearestShelter._km > 40) gaps.push(`- Nearest shelter is ${ctx.nearestShelter._km.toFixed(0)} km away`);
+  if (ctx.nearestHospital && ctx.nearestHospital._km > 50) gaps.push(`- Nearest hospital is ${ctx.nearestHospital._km.toFixed(0)} km away`);
+  if (ctx.sheltersWithin50 === 0) gaps.push('- No shelters within 50 km');
+  if (gaps.length === 0) gaps.push('- No major coverage gaps detected at this point');
+
+  lines.push(['INFRASTRUCTURE GAPS', gaps.join('\n')]);
+
+  lines.push(['RECOMMENDED FIRST ACTIONS', [
+    `- Validate readiness at ${ctx.nearestShelter ? ctx.nearestShelter.name : 'nearest shelter'}`,
+    `- Confirm staging at ${ctx.nearestLogistics ? ctx.nearestLogistics.name : 'nearest logistics hub'}`,
+    `- Coordinate with ${ctx.nearestFire ? ctx.nearestFire.name : 'local fire/EMS'}`,
+    `- Monitor active alert expirations`
+  ].join('\n')]);
+
+  lines.push(['DATA CONFIDENCE',
+    'High on weather alerts.\nMedium on infrastructure (demo unless replaced).\nMedium on risk surface (demo).']);
+
+  lines.push(['NEXT CHECKS', [
+    '- Re-pull NWS alerts',
+    '- Verify shelter capacity and access',
+    '- Confirm road network status',
+    '- Pull FEMA NRI county profile if available'
+  ].join('\n')]);
+
+  return lines;
+}
+
+function setBriefing(sections) {
+  const el = document.getElementById('briefing');
+  el.innerHTML = sections.map(([h, body]) =>
+    `<span class="h">${h}</span>${escapeHtml(body)}`
+  ).join('\n');
+}
+
+async function generateOperationalBriefing() {
+  setStatus('statusAi', 'warn', 'AI …');
+
+  let context, sections;
+  if (STATE.selectedAlert) {
+    context = { type: 'alert', alert: STATE.selectedAlert };
+    sections = buildHazardBriefing(STATE.selectedAlert);
+  } else if (STATE.selected) {
+    const ctx = analyzeContext(STATE.selected.lat, STATE.selected.lng);
+    // strip heavy fields for AI context payload
+    const slim = {
+      lat: ctx.lat, lng: ctx.lng,
+      nearestShelter:  ctx.nearestShelter  ? { name: ctx.nearestShelter.name,  km: +ctx.nearestShelter._km.toFixed(1) }  : null,
+      nearestHospital: ctx.nearestHospital ? { name: ctx.nearestHospital.name, km: +ctx.nearestHospital._km.toFixed(1) } : null,
+      sheltersWithin50:  ctx.sheltersWithin50,
+      hospitalsWithin50: ctx.hospitalsWithin50,
+      activeAlerts: ctx.alertsHere.map(f => ({
+        event: f.properties.event,
+        severity: f.properties.severity,
+        headline: f.properties.headline
+      }))
+    };
+    context = { type: 'point', point: slim };
+    sections = buildPointBriefing(ctx);
+  } else {
+    setBriefing([
+      ['SITUATION', 'No point selected. Click the map or a weather alert polygon, then press Generate AI Briefing.'],
+      ['NEXT CHECKS', '- Click a county or alert footprint\n- Try Find Gaps for top 5 coverage issues']
+    ]);
+    setStatus('statusAi', 'ok', 'AI ready');
+    return;
+  }
+
+  // Try LightRAG; fall back to mock sections.
+  try {
+    const aiResponse = await queryLightRAG(
+      'Provide an operational briefing for the Red Cross given the map context. ' +
+      'Use the headers SITUATION, RISK DRIVERS, INFRASTRUCTURE GAPS, RECOMMENDED FIRST ACTIONS, DATA CONFIDENCE, NEXT CHECKS.',
+      context
+    );
+    if (aiResponse && (aiResponse.response || aiResponse.result || aiResponse.answer)) {
+      const text = aiResponse.response || aiResponse.result || aiResponse.answer;
+      const parsed = parseBriefingText(text) || sections;
+      setBriefing(parsed);
+      setStatus('statusAi', 'ok', 'AI live');
+      return;
+    }
+  } catch (e) {
+    console.warn('LightRAG fallback to mock:', e);
+    setStatus('statusAi', 'warn', 'AI mock');
+  }
+
+  setBriefing(sections);
+  setStatus('statusAi', 'ok', LIGHTRAG_CONFIG.enabled ? 'AI mock' : 'AI ready');
+}
+
+function parseBriefingText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const headers = ['SITUATION','RISK DRIVERS','INFRASTRUCTURE GAPS','RECOMMENDED FIRST ACTIONS','DATA CONFIDENCE','NEXT CHECKS'];
+  const out = [];
+  let current = null;
+  text.split(/\r?\n/).forEach(line => {
+    const m = line.trim().match(/^([A-Z][A-Z \/-]+)[:\s]*$/);
+    if (m && headers.includes(m[1].trim())) {
+      if (current) out.push(current);
+      current = [m[1].trim(), ''];
+    } else if (current) {
+      current[1] += (current[1] ? '\n' : '') + line;
+    }
+  });
+  if (current) out.push(current);
+  return out.length ? out.map(([h, b]) => [h, b.trim()]) : null;
+}
+
+/* ============================================================================
+   GAP FINDER
+   ============================================================================ */
+function findGaps() {
+  // Sample candidate points across CONUS-ish bounding box and score them.
+  const candidates = [];
+  for (let lat = 25; lat <= 40; lat += 0.6) {
+    for (let lng = -100; lng <= -75; lng += 0.7) {
+      candidates.push({ lat, lng });
+    }
+  }
+
+  const scored = candidates.map(c => {
+    const ctx = analyzeContext(c.lat, c.lng);
+    const sheltKm = ctx.nearestShelter ? ctx.nearestShelter._km : 999;
+    const hospKm  = ctx.nearestHospital ? ctx.nearestHospital._km : 999;
+    const alertHit = ctx.alertsHere.length > 0 ? 1 : 0;
+    const sevWeight = ctx.alertsHere.reduce((a, f) => {
+      const s = (f.properties.severity || '').toLowerCase();
+      return a + (s === 'extreme' ? 3 : s === 'severe' ? 2 : s === 'moderate' ? 1 : 0.4);
+    }, 0);
+    const score = (sheltKm * 0.05) + (hospKm * 0.03) + (alertHit * 4) + (sevWeight * 1.5);
+    return { ...c, score, sheltKm, hospKm, alerts: ctx.alertsHere.length, sevWeight };
+  });
+
+  // Filter: must have alert OR very poor shelter coverage
+  const filtered = scored
+    .filter(s => s.alerts > 0 || s.sheltKm > 90)
+    .sort((a, b) => b.score - a.score);
+
+  // De-duplicate spatially (keep top-scoring within ~150 km)
+  const top = [];
+  filtered.forEach(s => {
+    if (!top.some(t => haversine(t.lat, t.lng, s.lat, s.lng) < 150)) top.push(s);
+  });
+  const top5 = top.slice(0, 5);
+
+  document.getElementById('kpiGaps').textContent = top5.length;
+  const list = document.getElementById('gapList');
+  if (top5.length === 0) {
+    list.innerHTML = '<div style="font-size:11.5px;color:var(--text-2);">No major gaps detected with current alerts.</div>';
+    return;
+  }
+
+  list.innerHTML = top5.map((g, i) => `
+    <div class="gap-item" data-lat="${g.lat}" data-lng="${g.lng}">
+      <div class="t">Gap #${i+1} · ${g.lat.toFixed(2)}, ${g.lng.toFixed(2)}</div>
+      <div class="d">Nearest shelter ${g.sheltKm.toFixed(0)} km · Nearest hospital ${g.hospKm.toFixed(0)} km · ${g.alerts} alert(s)</div>
+      <div class="score">Score ${g.score.toFixed(1)} · severity weight ${g.sevWeight.toFixed(1)}</div>
+    </div>
+  `).join('');
+
+  // Click to fly
+  list.querySelectorAll('.gap-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const lat = +el.dataset.lat, lng = +el.dataset.lng;
+      map.flyTo([lat, lng], 8, { duration: 1.1 });
+      STATE.selected = { lat, lng };
+      STATE.selectedAlert = null;
+      updateSelectedPoint();
+    });
+  });
+}
+
+/* ============================================================================
+   LAYER TOGGLES
+   ============================================================================ */
+document.querySelectorAll('.layer-row').forEach(row => {
+  row.addEventListener('click', () => {
+    const key = row.dataset.layer;
+    const sw = row.querySelector('.swatch');
+    const wasOn = sw.classList.contains('on');
+    sw.classList.toggle('on', !wasOn);
+    row.classList.toggle('active', !wasOn);
+    setLayerVisible(key, !wasOn);
+  });
+});
+
+function setLayerVisible(key, visible) {
+  STATE.layerVisible[key] = visible;
+  switch (key) {
+    case 'alerts':
+      if (STATE.alertLayer) visible ? STATE.alertLayer.addTo(map) : map.removeLayer(STATE.alertLayer);
+      break;
+    case 'risk':
+      if (STATE.riskHeat) visible ? STATE.riskHeat.addTo(map) : map.removeLayer(STATE.riskHeat);
+      break;
+    case 'arcs':
+      if (STATE.deckOk) {
+        // toggling deck.gl layers requires recreating; cheaper: toggle leaflet fallback only
+      } else if (STATE.arcsLayer) {
+        visible ? STATE.arcsLayer.addTo(map) : map.removeLayer(STATE.arcsLayer);
+      }
+      break;
+    case 'shelters':
+    case 'hospitals':
+    case 'fire':
+    case 'logistics': {
+      const t = key === 'shelters' ? 'shelter'
+              : key === 'hospitals' ? 'hospital'
+              : key === 'fire' ? 'fire' : 'logistics';
+      infraGroups[t].forEach(m => {
+        if (visible) STATE.cluster.addLayer(m);
+        else STATE.cluster.removeLayer(m);
+      });
+      break;
+    }
+  }
+  updateInViewKpi();
+}
+
+/* ============================================================================
+   IN-VIEW KPI
+   ============================================================================ */
+function updateInViewKpi() {
+  const b = map.getBounds();
+  const inView = DEMO_INFRASTRUCTURE.filter(p =>
+    b.contains([p.lat, p.lng]) && STATE.layerVisible[
+      p.type === 'shelter' ? 'shelters'
+      : p.type === 'hospital' ? 'hospitals'
+      : p.type === 'fire' ? 'fire' : 'logistics'
+    ]
+  ).length;
+  document.getElementById('kpiInfra').textContent = inView;
+}
+map.on('moveend zoomend', updateInViewKpi);
+
+/* ============================================================================
+   SEARCH (Nominatim)
+   ============================================================================ */
+const searchInput = document.getElementById('searchInput');
+const searchResults = document.getElementById('searchResults');
+let searchTimer = null;
+
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = searchInput.value.trim();
+  if (q.length < 3) { searchResults.style.display = 'none'; return; }
+  searchTimer = setTimeout(() => doSearch(q), 280);
+});
+
+searchInput.addEventListener('blur', () => {
+  setTimeout(() => searchResults.style.display = 'none', 180);
+});
+searchInput.addEventListener('focus', () => {
+  if (searchResults.children.length) searchResults.style.display = 'block';
+});
+
+async function doSearch(q) {
+  try {
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=6&q=' + encodeURIComponent(q);
+    const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const data = await resp.json();
+    if (!data.length) { searchResults.innerHTML = '<div style="color:var(--text-2);">No results</div>'; }
+    else {
+      searchResults.innerHTML = data.map(r =>
+        `<div data-lat="${r.lat}" data-lng="${r.lon}">${escapeHtml(r.display_name)}</div>`
+      ).join('');
+      searchResults.querySelectorAll('div[data-lat]').forEach(el => {
+        el.addEventListener('mousedown', () => {
+          const lat = +el.dataset.lat, lng = +el.dataset.lng;
+          map.flyTo([lat, lng], 9, { duration: 1.1 });
+          searchResults.style.display = 'none';
+          searchInput.value = '';
+        });
+      });
+    }
+    searchResults.style.display = 'block';
+  } catch (e) {
+    console.warn('search failed', e);
+  }
+}
+
+/* ============================================================================
+   BUTTONS
+   ============================================================================ */
+document.getElementById('btnBriefing').addEventListener('click', generateOperationalBriefing);
+document.getElementById('btnGaps').addEventListener('click', findGaps);
+document.getElementById('btnRefresh').addEventListener('click', loadNwsAlerts);
+
+/* ============================================================================
+   UTIL
+   ============================================================================ */
+function getCss(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+}
+function truncate(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+function formatTime(s) {
+  if (!s) return '—';
+  try { return new Date(s).toLocaleString(); } catch { return s; }
+}
+function setStatus(id, kind, txt) {
+  const dot = document.getElementById(id);
+  const lab = document.getElementById(id + 'Txt');
+  if (!dot) return;
+  dot.classList.remove('warn', 'err');
+  if (kind === 'warn') dot.classList.add('warn');
+  if (kind === 'err')  dot.classList.add('err');
+  if (lab && txt) lab.textContent = txt;
+}
+
+/* ============================================================================
+   BOOT
+   ============================================================================ */
+setStatus('statusAi', LIGHTRAG_CONFIG.enabled ? 'warn' : 'ok',
+          LIGHTRAG_CONFIG.enabled ? 'AI configured' : 'AI mock');
+window.addEventListener('load', () => {
+  setTimeout(() => {
+    const l = document.getElementById('loading');
+    l.style.opacity = '0';
+    setTimeout(() => l.remove(), 450);
+  }, 600);
+});
+</script>
+
+</body>
+</html>
